@@ -478,6 +478,111 @@ def push_entries(new_entries: list[TimeSlot],
     print(f"\nCreated: {created} entries | Failed: {failed}")
 
 
+# ─── Plan serialisation ───────────────────────────────────────────────────────
+
+def _build_plan_json(working_days: list[date],
+                     existing_by_day: dict[date, list[TimeSlot]],
+                     new_entries: list[TimeSlot],
+                     tz: ZoneInfo) -> list[dict]:
+    """Build the plan.json array (both existing and new entries)."""
+    plan = []
+    for day in working_days:
+        for slot in existing_by_day.get(day, []):
+            plan.append({
+                "description": slot.description,
+                "projectId":   "",
+                "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "date":        day.isoformat(),
+                "localStart":  slot.start.strftime("%H:%M"),
+                "localEnd":    slot.end.strftime("%H:%M"),
+                "ticketKey":   "",
+                "hours":       round(slot.duration_hours, 4),
+                "isExisting":  True,
+            })
+    for slot in new_entries:
+        plan.append({
+            "description": slot.description,
+            "projectId":   slot.project_id,
+            "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "date":        slot.day.isoformat(),
+            "localStart":  slot.start.strftime("%H:%M"),
+            "localEnd":    slot.end.strftime("%H:%M"),
+            "ticketKey":   slot.description.split()[0] if slot.description else "",
+            "hours":       round(slot.duration_hours, 4),
+            "isExisting":  False,
+        })
+    return plan
+
+
+def _write_plan_json(path: str, plan: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(plan, fh, indent=2)
+    print(f"Plan written to: {path}")
+
+
+def _write_plan_csv(path: str, plan: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["date", "start", "end", "ticket", "description", "project_id", "hours"])
+        for e in plan:
+            desc_parts = e["description"].split(None, 1)
+            ticket = desc_parts[0] if not e["isExisting"] and len(desc_parts) > 1 else ""
+            title  = desc_parts[1] if not e["isExisting"] and len(desc_parts) > 1 else e["description"]
+            writer.writerow([
+                e["date"], e["localStart"], e["localEnd"],
+                ticket, title, e["projectId"], e["hours"],
+            ])
+    print(f"Plan CSV written to: {path}")
+
+
+def _push_from_json(plan_path: str, api_key: str, workspace_id: str, tz: ZoneInfo) -> None:
+    """Read plan.json and submit only non-existing entries to Clockify."""
+    with open(plan_path, encoding="utf-8") as fh:
+        plan: list[dict] = json.load(fh)
+
+    to_submit = [e for e in plan if not e.get("isExisting")]
+    if not to_submit:
+        print("No new entries found in plan.json.")
+        return
+
+    print(f"Submitting {len(to_submit)} entries from {plan_path} …\n")
+    session = requests.Session()
+    session.headers.update({"X-Api-Key": api_key, "Content-Type": "application/json"})
+
+    created = failed = 0
+    for e in to_submit:
+        label = f"{e['description']} | {e['date']} {e['localStart']}–{e['localEnd']}"
+        payload = {
+            "description": e["description"],
+            "projectId":   e["projectId"],
+            "start":       e["start"],
+            "end":         e["end"],
+        }
+        try:
+            resp = session.post(
+                f"{CLOCKIFY_API_BASE}/workspaces/{workspace_id}/time-entries",
+                json=payload,
+            )
+            if resp.status_code in (200, 201):
+                print(f"{GREEN}✓{RESET} {label}")
+                created += 1
+            else:
+                try:
+                    msg = resp.json().get("message", resp.text)
+                except Exception:
+                    msg = resp.text
+                print(f"{RED}✗{RESET} {label} | HTTP {resp.status_code}: {msg}")
+                failed += 1
+        except requests.RequestException as exc:
+            print(f"{RED}✗{RESET} {label} | Error: {exc}")
+            failed += 1
+        time.sleep(RATE_LIMIT_DELAY_S)
+
+    print(f"\nCreated: {created} entries | Failed: {failed}")
+
+
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
@@ -488,24 +593,54 @@ def _parse_args() -> argparse.Namespace:
             "Examples:\n"
             "  python clockify_fill.py --dry-run\n"
             "  python clockify_fill.py --month 2026-04 --dry-run\n"
-            "  python clockify_fill.py --tickets my_tickets.txt\n"
+            "  python clockify_fill.py --from-json plan.json --config config.json\n"
         ),
     )
-    p.add_argument("--tickets", default="tickets.txt",       metavar="PATH",
+    p.add_argument("--tickets",      default="tickets.txt",        metavar="PATH",
                    help="Path to tickets file (default: tickets.txt)")
-    p.add_argument("--report",  default="clockify_report.csv", metavar="PATH",
+    p.add_argument("--report",       default="clockify_report.csv", metavar="PATH",
                    help="Path to Clockify CSV export (default: clockify_report.csv)")
-    p.add_argument("--config",  default="config.json",       metavar="PATH",
+    p.add_argument("--config",       default="config.json",        metavar="PATH",
                    help="Path to config file (default: config.json)")
-    p.add_argument("--dry-run", action="store_true",
+    p.add_argument("--dry-run",      action="store_true",
                    help="Show plan only, skip API calls")
-    p.add_argument("--month",   default=None, metavar="YYYY-MM",
+    p.add_argument("--month",        default=None, metavar="YYYY-MM",
                    help="Override 'month' from config")
+    p.add_argument("--output-json",  default=None, metavar="PATH",
+                   help="Write plan as JSON to this path (used with --dry-run)")
+    p.add_argument("--output-csv",   default=None, metavar="PATH",
+                   help="Write plan as CSV to this path (used with --dry-run)")
+    p.add_argument("--from-json",    default=None, metavar="PATH",
+                   help="Submit entries from a saved plan.json (skips generation)")
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    # ── --from-json: submit a pre-generated plan without regenerating ──────────
+    if args.from_json:
+        try:
+            cfg = load_config(args.config)
+        except FileNotFoundError:
+            print(f"Error: config file not found at '{args.config}'")
+            sys.exit(1)
+        api_key      = cfg.get("clockify_api_key", "")
+        workspace_id = cfg.get("workspace_id",     "")
+        tz_name      = cfg.get("timezone", "UTC")
+        if not api_key or api_key.startswith("YOUR_"):
+            print("Error: 'clockify_api_key' is not configured.")
+            sys.exit(1)
+        if not workspace_id or workspace_id.startswith("YOUR_"):
+            print("Error: 'workspace_id' is not configured.")
+            sys.exit(1)
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            print(f"Error: unknown timezone '{tz_name}'")
+            sys.exit(1)
+        _push_from_json(args.from_json, api_key, workspace_id, tz)
+        return
 
     # ── Config ────────────────────────────────────────────────────────────────
     try:
@@ -569,6 +704,14 @@ def main():
 
     # ── Display plan ──────────────────────────────────────────────────────────
     print_plan(working_days, existing_by_day, new_entries)
+
+    # ── Write output files if requested ───────────────────────────────────────
+    if args.output_json or args.output_csv:
+        plan_data = _build_plan_json(working_days, existing_by_day, new_entries, tz)
+        if args.output_json:
+            _write_plan_json(args.output_json, plan_data)
+        if args.output_csv:
+            _write_plan_csv(args.output_csv, plan_data)
 
     if args.dry_run:
         print("Dry-run mode — no entries will be created.")
