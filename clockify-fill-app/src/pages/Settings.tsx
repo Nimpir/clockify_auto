@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { saveSettings } from "../lib/storage";
 import { testClockifyConnection } from "../lib/sidecar";
@@ -13,19 +13,32 @@ const TIMEZONES = [
 interface Props {
   initial: Settings;
   onSave: (s: Settings) => void;
+  onSilentSave: (s: Settings) => void;
   addToast: (msg: string, type: Toast["type"]) => void;
 }
 
-export default function SettingsPage({ initial, onSave, addToast }: Props) {
+export default function SettingsPage({ initial, onSave, onSilentSave, addToast }: Props) {
   const [form, setForm] = useState<Settings>({ ...initial });
   const [showKey, setShowKey] = useState(false);
   const [testStatus, setTestStatus] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const formRef = useRef(form);
+  const isDirtyRef = useRef(false);
+  formRef.current = form;
 
   function set<K extends keyof Settings>(key: K, value: Settings[K]) {
+    isDirtyRef.current = true;
     setForm((f) => ({ ...f, [key]: value }));
   }
+
+  // Auto-save silently when navigating away (only if something changed)
+  useEffect(() => {
+    return () => {
+      if (!isDirtyRef.current) return;
+      saveSettings(formRef.current).then(() => onSilentSave(formRef.current)).catch(() => {});
+    };
+  }, []);
 
   async function handleSave() {
     setSaving(true);
@@ -155,6 +168,21 @@ export default function SettingsPage({ initial, onSave, addToast }: Props) {
           />
           <span className="text-sm text-slate-300">Skip weekends</span>
         </label>
+      </Section>
+
+      {/* Invoice */}
+      <Section title="Invoice">
+        <Field label="Default monthly total (USD)">
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={form.monthly_total || ""}
+            onChange={(e) => set("monthly_total", parseFloat(e.target.value) || 0)}
+            placeholder="3500"
+            className={inputCls}
+          />
+        </Field>
       </Section>
 
       {/* Storage */}

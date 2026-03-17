@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS: Settings = {
   work_end: "20:00",
   skip_weekends: true,
   documents_path: "",
+  monthly_total: 3500,
 };
 
 const DEFAULT_META = (month: string): MonthMeta => ({
@@ -38,8 +39,11 @@ async function ensureDir(path: string): Promise<void> {
 }
 
 export async function getMonthDir(month: string): Promise<string> {
-  const dataDir = await appDataDir();
-  return join(dataDir, "months", month);
+  const settings = await loadSettings();
+  const baseDir = settings.documents_path?.trim()
+    ? settings.documents_path.trim()
+    : await join(await appDataDir(), "months");
+  return join(baseDir, month);
 }
 
 // Settings
@@ -111,7 +115,11 @@ export async function saveTickets(
   const dir = await getMonthDir(month);
   await ensureDir(dir);
   const path = await join(dir, "tickets.txt");
-  const content = tickets.map((t) => `${t.key} | ${t.title} | ${t.projectId}`).join("\n");
+  const content = tickets.map((t) => {
+    let line = `${t.key} | ${t.title} | ${t.projectId}`;
+    if (t.dateFrom || t.dateTo) line += ` | ${t.dateFrom ?? ""} | ${t.dateTo ?? ""}`;
+    return line;
+  }).join("\n");
   await writeTextFile(path, content);
 }
 
@@ -122,9 +130,34 @@ function parseTicketsTxt(content: string): Ticket[] {
     .filter((l) => l && !l.startsWith("#"))
     .flatMap((l) => {
       const parts = l.split("|").map((p) => p.trim());
-      if (parts.length !== 3) return [];
-      return [{ key: parts[0], title: parts[1], projectId: parts[2] }];
+      if (parts.length < 3) return [];
+      return [{
+        key: parts[0],
+        title: parts[1],
+        projectId: parts[2],
+        dateFrom: parts[3] || undefined,
+        dateTo: parts[4] || undefined,
+      }];
     });
+}
+
+// Skip days (vacation / days off)
+export async function loadSkipDays(month: string): Promise<string[]> {
+  try {
+    const dir = await getMonthDir(month);
+    const path = await join(dir, "skip_days.json");
+    if (!(await exists(path))) return [];
+    return JSON.parse(await readTextFile(path));
+  } catch {
+    return [];
+  }
+}
+
+export async function saveSkipDays(month: string, days: string[]): Promise<void> {
+  const dir = await getMonthDir(month);
+  await ensureDir(dir);
+  const path = await join(dir, "skip_days.json");
+  await writeTextFile(path, JSON.stringify(days));
 }
 
 // Copy an imported CSV report into the month directory
@@ -141,7 +174,8 @@ export async function importReport(
 // Write a temporary config.json for the sidecar
 export async function writeConfigForMonth(
   month: string,
-  settings: Settings
+  settings: Settings,
+  extras?: Record<string, unknown>
 ): Promise<string> {
   const dir = await getMonthDir(month);
   await ensureDir(dir);
@@ -156,6 +190,8 @@ export async function writeConfigForMonth(
         work_start: settings.work_start,
         work_end: settings.work_end,
         skip_weekends: settings.skip_weekends,
+        ...(settings.monthly_total ? { monthly_total: settings.monthly_total } : {}),
+        ...extras,
         month,
       },
       null,

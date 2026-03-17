@@ -43,10 +43,13 @@ RATE_LIMIT_DELAY_S = 0.2
 # ─── Data structures ──────────────────────────────────────────────────────────
 
 class Ticket:
-    def __init__(self, key: str, title: str, project_id: str):
+    def __init__(self, key: str, title: str, project_id: str,
+                 date_from: date | None = None, date_to: date | None = None):
         self.key        = key.strip()
         self.title      = title.strip()
         self.project_id = project_id.strip()
+        self.date_from  = date_from   # None means no lower bound
+        self.date_to    = date_to     # None means no upper bound
 
     @property
     def description(self) -> str:
@@ -112,6 +115,17 @@ def load_config(path: str) -> dict:
     return json.loads(_strip_json_comments(raw))
 
 
+def _parse_ticket_date(s: str, lineno: int, field: str) -> date | None:
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"Warning: line {lineno} — invalid {field} date '{s}' (expected YYYY-MM-DD), ignoring.")
+        return None
+
+
 def load_tickets(path: str) -> list[Ticket]:
     tickets = []
     with open(path, encoding="utf-8") as fh:
@@ -120,11 +134,13 @@ def load_tickets(path: str) -> list[Ticket]:
             if not line or line.startswith("#"):
                 continue
             parts = [p.strip() for p in line.split("|")]
-            if len(parts) != 3:
+            if len(parts) < 3:
                 print(f"Warning: line {lineno} in tickets file has "
-                      f"{len(parts)} field(s) (expected 3), skipping.")
+                      f"{len(parts)} field(s) (expected 3–5), skipping.")
                 continue
-            tickets.append(Ticket(parts[0], parts[1], parts[2]))
+            date_from = _parse_ticket_date(parts[3], lineno, "date_from") if len(parts) > 3 else None
+            date_to   = _parse_ticket_date(parts[4], lineno, "date_to")   if len(parts) > 4 else None
+            tickets.append(Ticket(parts[0], parts[1], parts[2], date_from, date_to))
     return tickets
 
 
@@ -248,20 +264,44 @@ def compute_free_slots(day: date, existing: list[TimeSlot],
 
 # ─── Distribution algorithm ───────────────────────────────────────────────────
 
+def _ticket_distance(ticket: Ticket, day: date) -> int:
+    """Days between `day` and the ticket's date range (0 if covered)."""
+    if ticket.date_from and day < ticket.date_from:
+        return (ticket.date_from - day).days
+    if ticket.date_to and day > ticket.date_to:
+        return (day - ticket.date_to).days
+    return 0
+
+
+def get_active_tickets_for_day(day: date, tickets: list[Ticket]) -> list[Ticket]:
+    """
+    Returns tickets whose date range covers `day`.
+    Tickets with no date range always cover every day.
+    If no ticket covers the day, returns the ticket(s) with the closest range.
+    """
+    if not tickets:
+        return []
+    covering = [t for t in tickets if _ticket_distance(t, day) == 0]
+    if covering:
+        return covering
+    # Fall back to closest ticket(s) by date proximity
+    min_dist = min(_ticket_distance(t, day) for t in tickets)
+    return [t for t in tickets if _ticket_distance(t, day) == min_dist]
+
+
 def distribute_tickets(working_days: list[date],
                        existing_by_day: dict[date, list[TimeSlot]],
                        tickets: list[Ticket],
                        work_start: str, work_end: str) -> list[TimeSlot]:
     """
-    Distribute ticket hours evenly across all tickets into the free slots.
-    Returns a list of new TimeSlot objects (one per entry to create).
+    For each working day, find the active tickets (those whose date range covers
+    the day, or the closest ticket(s) if none cover it), then split the day's
+    free time evenly among them.
     """
     if not tickets:
         return []
 
-    # Gather free slots per day (only days that still need filling)
-    day_free_slots: dict[date, list[TimeSlot]] = {}
-    total_free_minutes = 0
+    new_entries: list[TimeSlot] = []
 
     for day in working_days:
         existing     = existing_by_day.get(day, [])
@@ -270,58 +310,41 @@ def distribute_tickets(working_days: list[date],
         if still_needed <= 0:
             continue
 
-        free_slots    = compute_free_slots(day, existing, work_start, work_end)
-        free_in_day   = sum(s.duration_minutes for s in free_slots)
-        usable         = min(still_needed, free_in_day)
+        free_slots  = compute_free_slots(day, existing, work_start, work_end)
+        free_in_day = sum(s.duration_minutes for s in free_slots)
+        usable      = min(still_needed, free_in_day)
 
         if usable < MIN_ENTRY_MINUTES:
             continue
 
-        day_free_slots[day] = free_slots
-        total_free_minutes  += usable
+        active = get_active_tickets_for_day(day, tickets)
+        # Budget per ticket for this day (even split)
+        budget_per_ticket = usable / len(active)
+        ticket_budget  = {t.key: budget_per_ticket for t in active}
+        ticket_by_key  = {t.key: t for t in active}
+        ticket_keys    = [t.key for t in active]
+        ticket_idx     = 0
+        day_remaining  = still_needed
 
-    if total_free_minutes == 0:
-        return []
-
-    # Target minutes per ticket (even distribution)
-    target_per_ticket = total_free_minutes / len(tickets)
-
-    # Track remaining budget per ticket
-    ticket_remaining = {t.key: target_per_ticket for t in tickets}
-    ticket_by_key    = {t.key: t for t in tickets}
-    ticket_keys      = [t.key for t in tickets]
-
-    new_entries: list[TimeSlot] = []
-    ticket_idx = 0   # index into ticket_keys (advances as tickets are exhausted)
-
-    for day in working_days:
-        if day not in day_free_slots:
-            continue
-
-        day_budget_remaining = WORK_DAY_MINUTES - day_logged_minutes(
-            existing_by_day.get(day, []))
-
-        for free_slot in day_free_slots[day]:
+        for free_slot in free_slots:
             slot_remaining = free_slot.duration_minutes
             cursor         = free_slot.start
 
             while slot_remaining >= MIN_ENTRY_MINUTES and ticket_idx < len(ticket_keys):
                 tkey   = ticket_keys[ticket_idx]
                 ticket = ticket_by_key[tkey]
-                t_rem  = ticket_remaining[tkey]
+                t_rem  = ticket_budget[tkey]
 
                 if t_rem < MIN_ENTRY_MINUTES:
-                    # This ticket's budget is spent; move on
                     ticket_idx += 1
                     continue
 
-                assign = min(slot_remaining, t_rem, day_budget_remaining)
+                assign = min(slot_remaining, t_rem, day_remaining)
 
                 if assign < MIN_ENTRY_MINUTES:
-                    break  # Can't fit a valid entry here today
+                    break
 
-                # If the leftover in the slot would be too small to be useful,
-                # absorb it into this entry (small rounding bump is acceptable).
+                # Absorb tiny leftovers to avoid orphan sub-30-min gaps
                 leftover = slot_remaining - assign
                 if 0 < leftover < MIN_ENTRY_MINUTES:
                     assign = slot_remaining
@@ -334,16 +357,16 @@ def distribute_tickets(working_days: list[date],
                     existing=False,
                 ))
 
-                ticket_remaining[tkey]  -= assign
-                slot_remaining          -= assign
-                day_budget_remaining    -= assign
-                cursor                   = entry_end
+                ticket_budget[tkey] -= assign
+                slot_remaining      -= assign
+                day_remaining       -= assign
+                cursor               = entry_end
 
-                if ticket_remaining[tkey] < MIN_ENTRY_MINUTES:
+                if ticket_budget[tkey] < MIN_ENTRY_MINUTES:
                     ticket_idx += 1
 
-            if day_budget_remaining < MIN_ENTRY_MINUTES:
-                break  # Day is full
+            if day_remaining < MIN_ENTRY_MINUTES:
+                break
 
     return new_entries
 
@@ -439,7 +462,7 @@ def _create_entry(session: requests.Session, workspace_id: str,
         "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    resp = session.post(url, json=payload)
+    resp = session.post(url, json=payload, timeout=30)
     if resp.status_code in (200, 201):
         return True, ""
     try:
@@ -484,35 +507,44 @@ def _build_plan_json(working_days: list[date],
                      existing_by_day: dict[date, list[TimeSlot]],
                      new_entries: list[TimeSlot],
                      tz: ZoneInfo) -> list[dict]:
-    """Build the plan.json array (both existing and new entries)."""
+    """Build the plan.json array ordered chronologically by day and start time."""
+    new_by_day: dict[date, list[TimeSlot]] = {}
+    for slot in new_entries:
+        new_by_day.setdefault(slot.day, []).append(slot)
+
     plan = []
     for day in working_days:
-        for slot in existing_by_day.get(day, []):
-            plan.append({
-                "description": slot.description,
-                "projectId":   "",
-                "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "date":        day.isoformat(),
-                "localStart":  slot.start.strftime("%H:%M"),
-                "localEnd":    slot.end.strftime("%H:%M"),
-                "ticketKey":   "",
-                "hours":       round(slot.duration_hours, 4),
-                "isExisting":  True,
-            })
-    for slot in new_entries:
-        plan.append({
-            "description": slot.description,
-            "projectId":   slot.project_id,
-            "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "date":        slot.day.isoformat(),
-            "localStart":  slot.start.strftime("%H:%M"),
-            "localEnd":    slot.end.strftime("%H:%M"),
-            "ticketKey":   slot.description.split()[0] if slot.description else "",
-            "hours":       round(slot.duration_hours, 4),
-            "isExisting":  False,
-        })
+        all_slots = sorted(
+            existing_by_day.get(day, []) + new_by_day.get(day, []),
+            key=lambda s: s.start,
+        )
+        for slot in all_slots:
+            if slot.existing:
+                plan.append({
+                    "description": slot.description,
+                    "projectId":   "",
+                    "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "date":        day.isoformat(),
+                    "localStart":  slot.start.strftime("%H:%M"),
+                    "localEnd":    slot.end.strftime("%H:%M"),
+                    "ticketKey":   "",
+                    "hours":       round(slot.duration_hours, 4),
+                    "isExisting":  True,
+                })
+            else:
+                plan.append({
+                    "description": slot.description,
+                    "projectId":   slot.project_id,
+                    "start":       _local_to_utc(slot.start, tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end":         _local_to_utc(slot.end,   tz).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "date":        day.isoformat(),
+                    "localStart":  slot.start.strftime("%H:%M"),
+                    "localEnd":    slot.end.strftime("%H:%M"),
+                    "ticketKey":   slot.description.split()[0] if slot.description else "",
+                    "hours":       round(slot.duration_hours, 4),
+                    "isExisting":  False,
+                })
     return plan
 
 
@@ -612,11 +644,331 @@ def _parse_args() -> argparse.Namespace:
                    help="Write plan as CSV to this path (used with --dry-run)")
     p.add_argument("--from-json",    default=None, metavar="PATH",
                    help="Submit entries from a saved plan.json (skips generation)")
+    p.add_argument("--invoice",      action="store_true",
+                   help="Generate .xlsx invoice from plan.json (requires openpyxl)")
+    p.add_argument("--plan",         default=None, metavar="PATH",
+                   help="Path to plan.json (used with --invoice; default: same dir as config)")
+    p.add_argument("--invoice-output", default=None, metavar="PATH",
+                   help="Output .xlsx path (used with --invoice; default: same dir as config)")
+    p.add_argument("--skip-days",    default=None, metavar="DATES",
+                   help="Comma-separated YYYY-MM-DD dates to exclude from scheduling (e.g. vacation)")
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    # ── --invoice: generate .xlsx invoice from plan.json ───────────────────────
+    if args.invoice:
+        try:
+            from openpyxl import Workbook            # type: ignore
+            from openpyxl.styles import Font, Alignment, Border, Side, PatternFill  # type: ignore
+            from openpyxl.worksheet.page import PageMargins  # type: ignore
+        except ImportError:
+            print("Error: 'openpyxl' not found. Install with: pip install openpyxl")
+            sys.exit(1)
+
+        from pathlib import Path
+
+        config_path = Path(args.config)
+        try:
+            config = load_config(str(config_path))
+        except FileNotFoundError:
+            print(f"Error: config file not found at '{config_path}'")
+            sys.exit(1)
+
+        if "monthly_total" not in config and "hourly_rate" not in config:
+            print("Error: 'monthly_total' not set in config.json. Add e.g. \"monthly_total\": 3500")
+            sys.exit(1)
+
+        month_str = args.month or config.get("month", "")
+        if not month_str:
+            print("Error: month not specified — use --month YYYY-MM or set 'month' in config.json")
+            sys.exit(1)
+        config["month"] = month_str
+
+        plan_path = Path(args.plan) if args.plan else config_path.parent / "plan.json"
+        try:
+            plan: list[dict] = json.loads(plan_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            print(f"Error: plan.json not found at '{plan_path}'")
+            sys.exit(1)
+
+        if not plan:
+            print("Error: plan.json is empty — generate a plan first.")
+            sys.exit(1)
+
+        # Compute output path
+        invoice_number = str(config.get("invoice_number", "espana"))[:10]
+        if args.invoice_output:
+            output_path = Path(args.invoice_output)
+        else:
+            now = datetime.now()
+            base = f"invoice_{invoice_number}_{now.year}{now.month:02d}{now.day:02d}"
+            output_path = config_path.parent / f"{base}.xlsx"
+            # Avoid overwriting a file that may be open — append _N suffix
+            counter = 1
+            while output_path.exists():
+                output_path = config_path.parent / f"{base}_{counter}.xlsx"
+                counter += 1
+
+        def calc_row_height(text: str, col_width: float, font_size: float = 10.0) -> float:
+            col_px = col_width * 7
+            avg_char_px = font_size * 0.55
+            chars_per_line = max(1, int(col_px / avg_char_px))
+            lines = 0
+            for paragraph in str(text).split("\n"):
+                if len(paragraph) == 0:
+                    lines += 1
+                else:
+                    lines += max(1, -(-len(paragraph) // chars_per_line))
+            return max(15.75, lines * font_size * 1.5)
+
+        # ── Build workbook ────────────────────────────────────────────────────
+        year_int, month_int = map(int, month_str.split("-"))
+        if month_int == 12:
+            inv_last = date(year_int + 1, 1, 1) - timedelta(days=1)
+        else:
+            inv_last = date(year_int, month_int + 1, 1) - timedelta(days=1)
+        while inv_last.weekday() >= 5:
+            inv_last -= timedelta(days=1)
+
+        monthly_total = float(config.get("monthly_total", config.get("hourly_rate", 0)))
+
+        entries_by_date: dict[str, list] = {}
+        for e in plan:
+            entries_by_date.setdefault(e["date"], []).append(e)
+        sorted_entries = []
+        for d in sorted(entries_by_date.keys(), reverse=True):
+            sorted_entries.extend(entries_by_date[d])
+
+        wb = Workbook()
+        ws = wb.active
+
+        ws.column_dimensions["A"].width = 16.71
+        ws.column_dimensions["B"].width = 59.29
+        ws.column_dimensions["C"].width = 14.86
+
+        for r, h in [(1, 34.5), (2, 71.25), (5, 33.0), (8, 42.75), (9, 71.25),
+                     (10, 15.0), (11, 15.0), (12, 18.0), (13, 21.0), (14, 20.25), (15, 21.75)]:
+            ws.row_dimensions[r].height = h
+
+        ws.merge_cells("A1:B1")
+        ws.merge_cells("A12:B12")
+        ws.merge_cells("A13:B13")
+        ws.merge_cells("A14:B14")
+        ws.merge_cells("A15:B15")
+
+        thin        = Side(border_style="thin")
+        all_borders = Border(top=thin, bottom=thin, left=thin, right=thin)
+        lr_border   = Border(left=thin, right=thin)
+        white_fill  = PatternFill(fill_type="solid", fgColor="FFFFFFFF")
+        no_fill     = PatternFill(fill_type=None)
+        cv          = Alignment(horizontal="center", vertical="center")
+
+        arial11      = Font(name="Arial", size=11)
+        arial11_bold = Font(name="Arial", size=11, bold=True)
+        verdana      = Font(name="Verdana")
+
+        # ── Header block (rows 1–15) ───────────────────────────────────────────
+        ws["A1"].value     = "SENDER_NAME"
+        ws["A1"].font      = Font(name="Arial", size=18, bold=True)
+
+        ws["A2"].value     = "EBAN"
+        ws["A2"].font      = arial11
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["B2"].value     = "SENDER_IBAN"
+        ws["B2"].font      = arial11
+        ws["B2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A3"].value     = "BIC"
+        ws["A3"].font      = arial11
+        ws["A3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["B3"].value     = "SENDER_BIC"
+        ws["B3"].font      = arial11
+        ws["B3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A4"].value     = "Bank name"
+        ws["A4"].font      = arial11
+        ws["A4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["B4"].value     = "SENDER_BANK_NAME"
+        ws["B4"].font      = arial11
+        ws["B4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A5"].value     = "Address "
+        ws["A5"].font      = arial11
+        ws["A5"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["B5"].value     = "SENDER_BANK_ADDRESS"
+        ws["B5"].font      = arial11
+        ws["B5"].alignment = Alignment(horizontal="left", vertical="center")
+
+        ws["A7"].value     = "Address:"
+        ws["A7"].font      = arial11_bold
+        ws["A7"].alignment = Alignment(horizontal="left", wrap_text=True)
+
+        ws["B7"].value     = "DATE:"
+        ws["B7"].font      = arial11_bold
+        ws["B7"].alignment = Alignment(horizontal="right")
+
+        now = datetime.now()
+        ws["C7"].value        = datetime(now.year, now.month, now.day)
+        ws["C7"].number_format = "mm-dd-yy"
+
+        ws["A8"].value     = "SENDER_ADDRESS1"
+        ws["A8"].font      = arial11
+        ws["A8"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["B8"].value     = "INVOICE #"
+        ws["B8"].font      = arial11_bold
+        ws["B8"].alignment = Alignment(horizontal="right", vertical="center")
+
+        ws["C8"].value     = invoice_number
+        ws["C8"].font      = arial11
+        ws["C8"].alignment = Alignment(horizontal="left", vertical="center")
+
+        ws["A9"].value     = "SENDER_ADDRESS2"
+        ws["A9"].font      = arial11
+        ws["A9"].alignment = Alignment(vertical="center", wrap_text=True)
+
+        ws["B9"].value     = "FOR:"
+        ws["B9"].font      = arial11_bold
+        ws["B9"].alignment = Alignment(horizontal="right", vertical="top", wrap_text=True)
+
+        ws["C9"].value     = "Software Development"
+        ws["C9"].font      = arial11
+        ws["C9"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+        ws["A10"].value        = "SENDER_PHONE"
+        ws["A10"].font         = arial11
+        ws["A10"].alignment    = Alignment(vertical="center")
+        ws["A10"].number_format = "@"
+
+        ws["A11"].value     = "Bill to:"
+        ws["A11"].font      = arial11_bold
+        ws["A11"].alignment = Alignment(horizontal="left")
+
+        ws["A12"].value     = "BILLTO_NAME"
+        ws["A12"].font      = arial11
+        ws["A12"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A13"].value     = "BILLTO_ADDRESS1"
+        ws["A13"].font      = arial11
+        ws["A13"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A14"].value     = "BILLTO_ADDRESS2"
+        ws["A14"].font      = arial11
+        ws["A14"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A15"].value        = "BILLTO_PHONE"
+        ws["A15"].font         = arial11
+        ws["A15"].alignment    = Alignment(horizontal="left", vertical="top")
+        ws["A15"].number_format = "@"
+
+        # ── Table header (row 16) ──────────────────────────────────────────────
+        for col, label in [("A", "Date"), ("B", "DESCRIPTION"), ("C", "HOURS")]:
+            cell = ws[f"{col}16"]
+            cell.value     = label
+            cell.alignment = cv
+            cell.border    = all_borders
+            cell.fill      = white_fill
+
+        # ── Time entries (rows 17+) ────────────────────────────────────────────
+        row = 17
+        for i, entry in enumerate(sorted_entries):
+            entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
+            fill = white_fill if i % 2 == 1 else no_fill
+
+            cell_a = ws.cell(row=row, column=1)
+            cell_a.value         = entry_date
+            cell_a.number_format = r"dd\/MM\/yyyy"
+            cell_a.alignment     = cv
+            cell_a.border        = lr_border
+            cell_a.fill          = fill
+            cell_a.font          = verdana
+
+            desc = entry.get("description", "")
+            key  = entry.get("ticketKey", "")
+            if not entry.get("isExisting", False) and key and desc.startswith(key):
+                desc = f"{key}   {desc[len(key):].lstrip()}"
+
+            cell_b = ws.cell(row=row, column=2)
+            cell_b.value     = desc
+            cell_b.alignment = Alignment(vertical="top", wrap_text=True)
+            cell_b.border    = lr_border
+            cell_b.fill      = fill
+            cell_b.font      = verdana
+
+            cell_c = ws.cell(row=row, column=3)
+            total_sec = int(entry.get("hours", 0) * 3600)
+            hh = total_sec // 3600; mm_v = (total_sec % 3600) // 60; ss = total_sec % 60
+            cell_c.value         = f"{hh:02d}:{mm_v:02d}:{ss:02d}"
+            cell_c.number_format = "HH:mm:ss"
+            cell_c.alignment     = cv
+            cell_c.border        = lr_border
+            cell_c.fill          = fill
+            cell_c.font          = verdana
+
+            ws.row_dimensions[row].height = calc_row_height(desc, 59.29)
+            row += 1
+
+        total_row = row
+
+        # ── TOTAL row ──────────────────────────────────────────────────────────
+        ws.cell(row=total_row, column=2).value        = "TOTAL"
+        ws.cell(row=total_row, column=2).font         = arial11_bold
+        ws.cell(row=total_row, column=2).alignment    = Alignment(horizontal="right")
+        ws.cell(row=total_row, column=2).border       = all_borders
+        ws.cell(row=total_row, column=2).fill         = white_fill
+
+        ws.cell(row=total_row, column=3).value        = float(monthly_total)
+        ws.cell(row=total_row, column=3).font         = arial11_bold
+        ws.cell(row=total_row, column=3).alignment    = Alignment(horizontal="right")
+        ws.cell(row=total_row, column=3).border       = all_borders
+        ws.cell(row=total_row, column=3).fill         = white_fill
+        ws.cell(row=total_row, column=3).number_format = '"$"#,##0_);[Red]("$"#,##0)'
+
+        ws.row_dimensions[total_row].height = 15.75
+
+        # ── Footer ─────────────────────────────────────────────────────────────
+        footer_lines = [
+            "Make all checks payable to SENDER_NAME",
+            "If you have any questions concerning this invoice, use the following contact information:",
+            "SENDER_NAME, SENDER_PHONE, SENDER_EMAIL",
+            "THANK YOU FOR YOUR BUSINESS! ",
+        ]
+        footer_start = total_row + 1
+        for i, line in enumerate(footer_lines):
+            r = footer_start + i
+            ws.merge_cells(f"A{r}:C{r}")
+            ws[f"A{r}"].value     = line
+            ws[f"A{r}"].alignment = Alignment(horizontal="center", wrap_text=True)
+            ws[f"A{r}"].font      = arial11
+            ws.row_dimensions[r].height = 15.75
+
+        # Last footer line: bold + vertical bottom
+        thank_you_row = footer_start + len(footer_lines) - 1
+        ws[f"A{thank_you_row}"].font      = arial11_bold
+        ws[f"A{thank_you_row}"].alignment = Alignment(horizontal="center", vertical="bottom")
+
+        # ── Page setup ─────────────────────────────────────────────────────────
+        last_row = thank_you_row
+        ws.print_area = f"A1:C{last_row}"
+        ws.page_setup.fitToPage   = True
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.paperSize   = ws.PAPERSIZE_A4
+        ws.page_margins = PageMargins(left=0.5, right=0.5, top=0.75, bottom=0.75, header=0.3, footer=0.3)
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(output_path))
+        print(f"Invoice written to: {output_path}")
+        sys.exit(0)
 
     # ── --from-json: submit a pre-generated plan without regenerating ──────────
     if args.from_json:
@@ -693,6 +1045,9 @@ def main():
 
     # ── Working days ──────────────────────────────────────────────────────────
     working_days = get_working_days(target_month, skip_weekends)
+    if args.skip_days:
+        skip_set = {s.strip() for s in args.skip_days.split(",") if s.strip()}
+        working_days = [d for d in working_days if d.isoformat() not in skip_set]
     print(f"Working days in {target_month}: {len(working_days)}")
 
     # ── Distribute ────────────────────────────────────────────────────────────
@@ -700,6 +1055,12 @@ def main():
 
     if not new_entries:
         print("No free slots available to fill — all days may already be at 8h.")
+        if args.output_json or args.output_csv:
+            plan_data = _build_plan_json(working_days, existing_by_day, [], tz)
+            if args.output_json:
+                _write_plan_json(args.output_json, plan_data)
+            if args.output_csv:
+                _write_plan_csv(args.output_csv, plan_data)
         sys.exit(0)
 
     # ── Display plan ──────────────────────────────────────────────────────────

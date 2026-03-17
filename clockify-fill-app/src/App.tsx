@@ -4,6 +4,7 @@ import Toast from "./components/Toast";
 import Dashboard from "./pages/Dashboard";
 import Settings from "./pages/Settings";
 import { loadSettings } from "./lib/storage";
+import { logger } from "./lib/logger";
 import type { Toast as ToastType, Settings as SettingsType } from "./lib/types";
 
 let toastCounter = 0;
@@ -14,6 +15,7 @@ export default function App() {
   const [toasts, setToasts] = useState<ToastType[]>([]);
 
   useEffect(() => {
+    logger.info("App started");
     loadSettings().then(setSettings);
   }, []);
 
@@ -45,6 +47,10 @@ export default function App() {
     addToast("Settings saved", "success");
   }, [addToast]);
 
+  const handleSettingsSilentSave = useCallback((s: SettingsType) => {
+    setSettings(s);
+  }, []);
+
   if (!settings) {
     return (
       <div className="flex items-center justify-center h-screen bg-slate-900 text-slate-400">
@@ -64,6 +70,7 @@ export default function App() {
           <Settings
             initial={settings}
             onSave={handleSettingsSave}
+            onSilentSave={handleSettingsSilentSave}
             addToast={addToast}
           />
         )}

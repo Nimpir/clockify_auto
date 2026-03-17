@@ -33,11 +33,26 @@
     "shell:default",
     "shell:allow-open",
     {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/clockify_fill",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
       "identifier": "shell:allow-execute",
       "allow": [
         {
           "name": "binaries/clockify_fill",
           "sidecar": true,
+          "args": true
+        },
+        {
+          "name": "explorer",
+          "cmd": "explorer",
           "args": true
         }
       ]

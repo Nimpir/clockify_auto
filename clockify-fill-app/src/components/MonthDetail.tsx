@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { open as openShell } from "@tauri-apps/plugin-shell";
+import { Command } from "@tauri-apps/plugin-shell";
 import { exists } from "@tauri-apps/plugin-fs";
 import { join } from "@tauri-apps/api/path";
+import { logger } from "../lib/logger";
 import PlanTable from "./PlanTable";
 import type { MonthMeta, Ticket, PlanEntry, Settings } from "../lib/types";
 import {
@@ -13,8 +14,10 @@ import {
   loadPlan,
   importReport,
   getMonthDir,
+  loadSkipDays,
+  saveSkipDays,
 } from "../lib/storage";
-import { generatePlan, submitPlan } from "../lib/sidecar";
+import { generatePlan, submitPlan, fetchClockifyEntries, generateInvoice } from "../lib/sidecar";
 
 const MONTH_NAMES = [
   "January","February","March","April","May","June",
@@ -26,32 +29,42 @@ interface Props {
   settings: Settings;
   onBack: () => void;
   onMetaChange: (meta: MonthMeta) => void;
-  addToast: (msg: string, type: "success" | "error" | "info") => void;
+  addToast: (msg: string, type: "success" | "error" | "info" | "warning") => void;
 }
 
 export default function MonthDetail({ month, settings, onBack, onMetaChange, addToast }: Props) {
   const [meta, setMeta] = useState<MonthMeta | null>(null);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [plan, setPlan] = useState<PlanEntry[]>([]);
+  const [skipDays, setSkipDays] = useState<string[]>([]);
   const [editingTickets, setEditingTickets] = useState(false);
   const [draftTickets, setDraftTickets] = useState<Ticket[]>([]);
   const [generating, setGenerating] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitModal, setSubmitModal] = useState(false);
   const [progress, setProgress] = useState<string[]>([]);
+  const [generatingInvoice, setGeneratingInvoice] = useState(false);
+  const [invoiceExists, setInvoiceExists] = useState(false);
+  const [monthlyTotal, setMonthlyTotal] = useState<number>(0);
+  const [invoiceNumber, setInvoiceNumber] = useState<string>("espana");
+  const [daysOffOpen, setDaysOffOpen] = useState(false);
 
   const monthName = MONTH_NAMES[parseInt(month.split("-")[1]) - 1];
   const year = month.split("-")[0];
 
   const reload = useCallback(async () => {
-    const [m, t, p] = await Promise.all([
+    const [m, t, p, s] = await Promise.all([
       loadMonthMeta(month),
       loadTickets(month),
       loadPlan(month),
+      loadSkipDays(month),
     ]);
     setMeta(m);
     setTickets(t);
     setPlan(p);
+    setSkipDays(s);
+    setMonthlyTotal(m.monthly_total_override ?? settings.monthly_total ?? 3500);
+    setInvoiceNumber(m.invoice_number ?? "espana");
   }, [month]);
 
   useEffect(() => { reload(); }, [reload]);
@@ -84,8 +97,10 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
       setTickets(t);
       await updateMeta({ tickets_loaded: t.length > 0 });
       addToast(`Loaded ${t.length} ticket(s)`, "success");
+      if (t.length > 0) handleGenerate();
     } catch (e) {
-      addToast(`Failed to load tickets: ${e}`, "error");
+      logger.error("handleLoadTickets failed", String(e));
+      addToast(`Failed to load tickets: ${String(e)}`, "error");
     }
   }
 
@@ -100,8 +115,36 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
       await importReport(month, selected as string);
       await updateMeta({ report_loaded: true });
       addToast("Report imported", "success");
+      handleGenerate();
     } catch (e) {
-      addToast(`Failed to import report: ${e}`, "error");
+      logger.error("handleLoadReport failed", String(e));
+      addToast(`Failed to import report: ${String(e)}`, "error");
+    }
+  }
+
+  // ── Fetch report from Clockify API ───────────────────────────────────────────
+  async function handleFetchReport() {
+    if (!settings.clockify_api_key || !settings.workspace_id) {
+      addToast("Configure API key and workspace ID in Settings first", "info");
+      return;
+    }
+    setFetchingReport(true);
+    try {
+      const result = await fetchClockifyEntries(month, settings);
+      if ("error" in result) {
+        logger.error("handleFetchReport failed", result.error);
+        addToast(`Failed to fetch entries: ${result.error}`, "error");
+      } else {
+        setReportExists(true);
+        await updateMeta({ report_loaded: true });
+        addToast(`Fetched ${result.count} entries from Clockify`, "success");
+        handleGenerate();
+      }
+    } catch (e) {
+      logger.error("handleFetchReport threw", String(e));
+      addToast(`Error fetching entries: ${String(e)}`, "error");
+    } finally {
+      setFetchingReport(false);
     }
   }
 
@@ -134,22 +177,28 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
 
   // ── Generate ─────────────────────────────────────────────────────────────────
   async function handleGenerate() {
-    if (!settings.clockify_api_key && !settings.workspace_id) {
-      addToast("Configure API key and workspace ID in Settings first", "info");
+    if (tickets.length === 0) {
+      addToast("tickets.txt is empty — add tickets before generating", "warning");
+      return;
     }
     setGenerating(true);
+    setPlan((p) => p.filter((e) => e.isExisting));
     try {
-      const result = await generatePlan(month, settings);
+      const currentSkipDays = await loadSkipDays(month);
+      setSkipDays(currentSkipDays);
+      logger.info("handleGenerate skipDays", { skipDays: currentSkipDays });
+      const result = await generatePlan(month, settings, currentSkipDays);
       if (result.code !== 0) {
         addToast(`Generation failed: ${result.stderr || result.stdout}`, "error");
       } else {
         const p = await loadPlan(month);
         setPlan(p);
-        await updateMeta({ plan_generated: true, last_generated_at: new Date().toISOString() });
+        await updateMeta({ plan_generated: true, last_generated_at: new Date().toISOString(), submitted: false, submitted_at: null });
         addToast(`Plan generated — ${p.filter((e) => !e.isExisting).length} new entries`, "success");
       }
     } catch (e) {
-      addToast(`Error: ${e}`, "error");
+      logger.error("handleGenerate threw", String(e));
+      addToast(`Error: ${String(e)}`, "error");
     } finally {
       setGenerating(false);
     }
@@ -157,11 +206,16 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
 
   // ── Submit ───────────────────────────────────────────────────────────────────
   async function handleSubmit() {
+    if (!settings.clockify_api_key || !settings.workspace_id) {
+      addToast("Configure API key and workspace ID in Settings first", "info");
+      setSubmitModal(false);
+      return;
+    }
     setSubmitModal(false);
     setSubmitting(true);
     setProgress([]);
     try {
-      const { created, failed } = await submitPlan(month, settings, (line) => {
+      const { created, failed, warnings } = await submitPlan(month, settings, (line) => {
         setProgress((p) => [...p, line.trim()].slice(-20));
       });
       await updateMeta({
@@ -174,22 +228,58 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
         `Done — created ${created} entries${failed > 0 ? `, ${failed} failed` : ""}`,
         failed > 0 ? "error" : "success"
       );
+      for (const w of warnings) {
+        addToast(w, "warning");
+      }
     } catch (e) {
-      addToast(`Submit error: ${e}`, "error");
+      logger.error("handleSubmit threw", String(e));
+      addToast(`Submit error: ${String(e)}`, "error");
     } finally {
       setSubmitting(false);
       setProgress([]);
     }
   }
 
+  // ── Generate invoice ─────────────────────────────────────────────────────────
+  async function handleGenerateInvoice() {
+    const total = monthlyTotal || settings.monthly_total || 3500;
+    setGeneratingInvoice(true);
+    try {
+      const result = await generateInvoice(month, settings, total, invoiceNumber || "espana");
+      if (result.code !== 0) {
+        addToast(`Invoice generation failed: ${result.stderr || result.stdout}`, "error");
+      } else {
+        addToast("Invoice generated", "success");
+        setInvoiceExists(true);
+      }
+    } catch (e) {
+      logger.error("handleGenerateInvoice threw", String(e));
+      addToast(`Error: ${String(e)}`, "error");
+    } finally {
+      setGeneratingInvoice(false);
+    }
+  }
+
   // ── Open folder ──────────────────────────────────────────────────────────────
   async function handleOpenFolder() {
     const dir = await getMonthDir(month);
-    await openShell(dir);
+    logger.info("handleOpenFolder", { dir });
+    try {
+      if (!(await exists(dir))) {
+        const { mkdir } = await import("@tauri-apps/plugin-fs");
+        await mkdir(dir, { recursive: true });
+        logger.info("handleOpenFolder created dir", { dir });
+      }
+      await Command.create("explorer", [dir]).execute();
+    } catch (e) {
+      logger.error("handleOpenFolder failed", String(e));
+      addToast(`Failed to open folder: ${String(e)}`, "error");
+    }
   }
 
-  // ── Report file presence ─────────────────────────────────────────────────────
+  // ── Report / invoice file presence ───────────────────────────────────────────
   const [reportExists, setReportExists] = useState(false);
+  const [fetchingReport, setFetchingReport] = useState(false);
   useEffect(() => {
     (async () => {
       const dir = await getMonthDir(month);
@@ -197,7 +287,45 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
     })();
   }, [month, meta?.report_loaded]);
 
+  useEffect(() => {
+    (async () => {
+      const dir = await getMonthDir(month);
+      const { readDir } = await import("@tauri-apps/plugin-fs");
+      try {
+        const entries = await readDir(dir);
+        setInvoiceExists(entries.some((e) => e.name?.startsWith("invoice_") && e.name.endsWith(".xlsx")));
+      } catch {
+        setInvoiceExists(false);
+      }
+    })();
+  }, [month, generatingInvoice]);
+
   const newEntryCount = plan.filter((e) => !e.isExisting).length;
+
+  // Weekdays only for the days-off picker (weekends are always excluded)
+  const monthWorkingDays = (() => {
+    const [y, m] = month.split("-").map(Number);
+    const days: string[] = [];
+    const d = new Date(y, m - 1, 1);
+    while (d.getMonth() === m - 1) {
+      const dow = d.getDay();
+      if (dow !== 0 && dow !== 6) {
+        const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        days.push(iso);
+      }
+      d.setDate(d.getDate() + 1);
+    }
+    return days;
+  })();
+
+  async function toggleSkipDay(day: string) {
+    const current = await loadSkipDays(month);
+    const updated = current.includes(day)
+      ? current.filter((d) => d !== day)
+      : [...current, day];
+    setSkipDays(updated);
+    await saveSkipDays(month, updated);
+  }
 
   if (!meta) {
     return (
@@ -252,13 +380,71 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
         {/* Report */}
         <div className="bg-slate-800 border border-slate-700 rounded-lg p-4">
           <div className="flex items-center justify-between mb-1">
-            <span className="text-sm font-medium text-slate-200">📊 clockify_report.csv</span>
-            <Btn size="xs" onClick={handleLoadReport}>Load CSV</Btn>
+            <span className="text-sm font-medium text-slate-200">📊 Existing entries</span>
+            <div className="flex gap-2">
+              <Btn size="xs" onClick={handleFetchReport} loading={fetchingReport}>
+                {fetchingReport ? "Fetching…" : "From Clockify"}
+              </Btn>
+              <Btn size="xs" onClick={handleLoadReport}>Load CSV</Btn>
+            </div>
           </div>
           <p className="text-xs text-slate-500">
-            {reportExists ? "CSV imported" : "No report — click Load CSV"}
+            {reportExists ? "Entries loaded" : "No existing entries — fetch from Clockify or load CSV"}
           </p>
         </div>
+      </section>
+
+      {/* Days off */}
+      <section className="mb-6">
+        <button
+          onClick={() => setDaysOffOpen((o) => !o)}
+          className="flex items-center gap-2 w-full text-left mb-2"
+        >
+          <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+            Days off
+          </h2>
+          {skipDays.length > 0 && (
+            <span className="text-amber-400 text-xs font-normal">
+              {skipDays.length} skipped
+            </span>
+          )}
+          <span className="text-slate-500 text-xs ml-auto">{daysOffOpen ? "▲" : "▼"}</span>
+        </button>
+        {daysOffOpen && (
+          <>
+            <div className="flex flex-wrap gap-1.5">
+              {monthWorkingDays.map((day) => {
+                const d = new Date(day + "T00:00:00");
+                const dow = ["Su","Mo","Tu","We","Th","Fr","Sa"][d.getDay()];
+                const num = d.getDate();
+                const skipped = skipDays.includes(day);
+                return (
+                  <button
+                    key={day}
+                    onClick={() => toggleSkipDay(day)}
+                    title={day}
+                    className={`flex flex-col items-center px-2 py-1 rounded text-xs font-medium transition-colors ${
+                      skipped
+                        ? "bg-amber-600/30 border border-amber-500/50 text-amber-300 line-through"
+                        : "bg-slate-700 border border-slate-600 text-slate-300 hover:border-slate-400 hover:text-white"
+                    }`}
+                  >
+                    <span className="text-[10px] opacity-70">{dow}</span>
+                    <span>{num}</span>
+                  </button>
+                );
+              })}
+            </div>
+            {skipDays.length > 0 && (
+              <button
+                onClick={async () => { setSkipDays([]); await saveSkipDays(month, []); }}
+                className="mt-2 text-xs text-slate-500 hover:text-slate-300 transition-colors"
+              >
+                Clear all
+              </button>
+            )}
+          </>
+        )}
       </section>
 
       {/* Ticket editor */}
@@ -274,6 +460,8 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
                   <th className="text-left px-3 py-2 text-slate-400 font-medium">Key</th>
                   <th className="text-left px-3 py-2 text-slate-400 font-medium">Title</th>
                   <th className="text-left px-3 py-2 text-slate-400 font-medium">Project ID</th>
+                  <th className="text-left px-3 py-2 text-slate-400 font-medium">From</th>
+                  <th className="text-left px-3 py-2 text-slate-400 font-medium">To</th>
                   <th className="w-8" />
                 </tr>
               </thead>
@@ -302,6 +490,22 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
                         onChange={(e) => updateDraft(i, "projectId", e.target.value)}
                         placeholder="Clockify project ID"
                         className="w-full bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500"
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <input
+                        type="date"
+                        value={t.dateFrom ?? ""}
+                        onChange={(e) => updateDraft(i, "dateFrom", e.target.value)}
+                        className="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500"
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <input
+                        type="date"
+                        value={t.dateTo ?? ""}
+                        onChange={(e) => updateDraft(i, "dateTo", e.target.value)}
+                        className="bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500"
                       />
                     </td>
                     <td className="px-2 py-1">
@@ -334,32 +538,80 @@ export default function MonthDetail({ month, settings, onBack, onMetaChange, add
       <section className="mb-6">
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Plan</h2>
-          <Btn size="sm" onClick={handleGenerate} loading={generating}>
-            {generating ? "Generating…" : "↻ Regenerate"}
-          </Btn>
+          <div className="flex items-center gap-2">
+            {plan.length > 0 && (
+              <>
+                <Btn
+                  size="sm"
+                  onClick={() => setSubmitModal(true)}
+                  disabled={submitting || meta.submitted || newEntryCount === 0}
+                  variant={meta.submitted ? "ghost" : "primary"}
+                  loading={submitting}
+                >
+                  {submitting ? "Submitting…" : meta.submitted ? "✓ Submitted" : `🚀 Submit ${newEntryCount}`}
+                </Btn>
+                <Btn size="sm" variant="ghost" onClick={() => setPlan([])}>
+                  Clear
+                </Btn>
+              </>
+            )}
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1">
+                <span className="text-slate-400 text-xs whitespace-nowrap">Amount $</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={monthlyTotal || ""}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value) || 0;
+                    setMonthlyTotal(val);
+                    updateMeta({ monthly_total_override: val || undefined });
+                  }}
+                  className="w-20 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <label className="flex items-center gap-1">
+                <span className="text-slate-400 text-xs whitespace-nowrap">Invoice #</span>
+                <input
+                  type="text"
+                  value={invoiceNumber}
+                  onChange={(e) => {
+                    const val = e.target.value.slice(0, 10);
+                    setInvoiceNumber(val);
+                    updateMeta({ invoice_number: val || undefined });
+                  }}
+                  placeholder="espana"
+                  maxLength={10}
+                  className="w-20 bg-slate-700 border border-slate-600 rounded px-2 py-1 text-xs text-white focus:outline-none focus:border-indigo-500"
+                />
+              </label>
+              <Btn
+                size="sm"
+                variant="ghost"
+                onClick={handleGenerateInvoice}
+                disabled={generatingInvoice || plan.length === 0}
+                loading={generatingInvoice}
+              >
+                {generatingInvoice ? "Generating…" : invoiceExists ? "↻ Invoice" : "📄 Invoice"}
+              </Btn>
+            </div>
+            <Btn size="sm" onClick={handleGenerate} loading={generating}>
+              {generating ? "Generating…" : plan.length > 0 ? "↻ Regenerate" : "Generate"}
+            </Btn>
+          </div>
         </div>
         <PlanTable entries={plan} />
       </section>
 
-      {/* Actions */}
-      {plan.length > 0 && (
-        <div className="flex gap-3">
-          <Btn
-            onClick={() => setSubmitModal(true)}
-            disabled={submitting || meta.submitted || newEntryCount === 0}
-            variant={meta.submitted ? "ghost" : "primary"}
-          >
-            {meta.submitted ? "✓ Already submitted" : `🚀 Submit ${newEntryCount} entries to Clockify`}
-          </Btn>
-        </div>
-      )}
-
       {/* Submit progress */}
-      {submitting && progress.length > 0 && (
+      {submitting && (
         <div className="mt-4 bg-slate-800 border border-slate-700 rounded-lg p-3 font-mono text-xs text-slate-300 max-h-40 overflow-y-auto">
-          {progress.map((line, i) => (
-            <div key={i}>{line}</div>
-          ))}
+          {progress.length === 0 ? (
+            <div className="text-slate-400 animate-pulse">Sending entries to Clockify…</div>
+          ) : (
+            progress.map((line, i) => <div key={i}>{line}</div>)
+          )}
         </div>
       )}
 

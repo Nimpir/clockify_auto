@@ -26,6 +26,7 @@ function ToastItem({ toast, onDismiss }: { toast: ToastType; onDismiss: (id: num
     success: "bg-green-600 border-green-500",
     error: "bg-red-700 border-red-500",
     info: "bg-indigo-600 border-indigo-500",
+    warning: "bg-amber-600 border-amber-500",
   };
 
   return (

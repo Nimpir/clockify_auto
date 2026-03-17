@@ -11,6 +11,8 @@ export interface MonthMeta {
   entries_created: number;
   entries_failed: number;
   last_generated_at: string | null;
+  monthly_total_override?: number;
+  invoice_number?: string;
 }
 
 export interface Settings {
@@ -21,6 +23,7 @@ export interface Settings {
   work_end: string;
   skip_weekends: boolean;
   documents_path: string;
+  monthly_total: number;
 }
 
 export interface PlanEntry {
@@ -40,10 +43,12 @@ export interface Ticket {
   key: string;
   title: string;
   projectId: string;
+  dateFrom?: string;  // YYYY-MM-DD, optional
+  dateTo?: string;    // YYYY-MM-DD, optional
 }
 
 export interface Toast {
   id: number;
   message: string;
-  type: "success" | "error" | "info";
+  type: "success" | "error" | "info" | "warning";
 }
