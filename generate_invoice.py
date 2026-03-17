@@ -89,7 +89,7 @@ def calc_row_height(text: str, col_width: float, font_size: float = 10.0) -> flo
 
 # ─── Invoice builder ──────────────────────────────────────────────────────────
 
-def generate_invoice(plan: list[dict], config: dict, output_path: Path) -> None:
+def generate_invoice(plan: list[dict], config: dict, output_path: Path, table_only: bool = False) -> None:
     year_int, month_int = map(int, config["month"].split("-"))
     inv_date      = last_working_day(year_int, month_int)
     monthly_total = float(config.get("monthly_total", config.get("hourly_rate", 0)))
@@ -110,18 +110,6 @@ def generate_invoice(plan: list[dict], config: dict, output_path: Path) -> None:
     ws.column_dimensions["B"].width = 59.29
     ws.column_dimensions["C"].width = 14.86
 
-    # ── Row heights (header block) ─────────────────────────────────────────────
-    for r, h in [(1, 34.5), (2, 71.25), (5, 33.0), (8, 42.75), (9, 71.25),
-                 (10, 15.0), (11, 15.0), (12, 18.0), (13, 21.0), (14, 20.25), (15, 21.75)]:
-        ws.row_dimensions[r].height = h
-
-    # ── Merged cells (header) ──────────────────────────────────────────────────
-    ws.merge_cells("A1:B1")
-    ws.merge_cells("A12:B12")
-    ws.merge_cells("A13:B13")
-    ws.merge_cells("A14:B14")
-    ws.merge_cells("A15:B15")
-
     # ── Shared style objects ───────────────────────────────────────────────────
     thin        = Side(border_style="thin")
     all_borders = Border(top=thin, bottom=thin, left=thin, right=thin)
@@ -134,115 +122,132 @@ def generate_invoice(plan: list[dict], config: dict, output_path: Path) -> None:
     arial11_bold = Font(name="Arial", size=11, bold=True)
     verdana      = Font(name="Verdana")
 
-    # ── Header block (rows 1–15) ───────────────────────────────────────────────
-    ws["A1"].value     = "SENDER_NAME"
-    ws["A1"].font      = Font(name="Arial", size=18, bold=True)
+    if not table_only:
+        # ── Row heights (header block) ─────────────────────────────────────────
+        for r, h in [(1, 34.5), (2, 71.25), (5, 33.0), (8, 42.75), (9, 71.25),
+                     (10, 15.0), (11, 15.0), (12, 18.0), (13, 21.0), (14, 20.25), (15, 21.75)]:
+            ws.row_dimensions[r].height = h
 
-    ws["A2"].value     = "EBAN"
-    ws["A2"].font      = arial11
-    ws["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        # ── Merged cells (header) ─────────────────────────────────────────────
+        ws.merge_cells("A1:B1")
+        ws.merge_cells("A12:B12")
+        ws.merge_cells("A13:B13")
+        ws.merge_cells("A14:B14")
+        ws.merge_cells("A15:B15")
 
-    ws["B2"].value     = "SENDER_IBAN"
-    ws["B2"].font      = arial11
-    ws["B2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        # ── Header block (rows 1–15) ───────────────────────────────────────────
+        sender   = config.get("sender", {})
+        bill_to  = config.get("bill_to", {})
 
-    ws["A3"].value     = "BIC"
-    ws["A3"].font      = arial11
-    ws["A3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A1"].value     = sender.get("name", "")
+        ws["A1"].font      = Font(name="Arial", size=18, bold=True)
 
-    ws["B3"].value     = "SENDER_BIC"
-    ws["B3"].font      = arial11
-    ws["B3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A2"].value     = "IBAN"
+        ws["A2"].font      = arial11
+        ws["A2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["A4"].value     = "Bank name"
-    ws["A4"].font      = arial11
-    ws["A4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["B2"].value     = sender.get("iban", "")
+        ws["B2"].font      = arial11
+        ws["B2"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["B4"].value     = "SENDER_BANK_NAME"
-    ws["B4"].font      = arial11
-    ws["B4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A3"].value     = "BIC"
+        ws["A3"].font      = arial11
+        ws["A3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["A5"].value     = "Address "
-    ws["A5"].font      = arial11
-    ws["A5"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["B3"].value     = sender.get("bic", "")
+        ws["B3"].font      = arial11
+        ws["B3"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["B5"].value     = "SENDER_BANK_ADDRESS"
-    ws["B5"].font      = arial11
-    ws["B5"].alignment = Alignment(horizontal="left", vertical="center")
+        ws["A4"].value     = "Bank name"
+        ws["A4"].font      = arial11
+        ws["A4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["A7"].value     = "Address:"
-    ws["A7"].font      = arial11_bold
-    ws["A7"].alignment = Alignment(horizontal="left", wrap_text=True)
+        ws["B4"].value     = sender.get("bank_name", "")
+        ws["B4"].font      = arial11
+        ws["B4"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["B7"].value     = "DATE:"
-    ws["B7"].font      = arial11_bold
-    ws["B7"].alignment = Alignment(horizontal="right")
+        ws["A5"].value     = "Address"
+        ws["A5"].font      = arial11
+        ws["A5"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    today = datetime.now()
-    ws["C7"].value        = datetime(today.year, today.month, today.day)
-    ws["C7"].number_format = "mm-dd-yy"
+        ws["B5"].value     = sender.get("bank_address", "")
+        ws["B5"].font      = arial11
+        ws["B5"].alignment = Alignment(horizontal="left", vertical="center")
 
-    ws["A8"].value     = "SENDER_ADDRESS1"
-    ws["A8"].font      = arial11
-    ws["A8"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A7"].value     = "Address:"
+        ws["A7"].font      = arial11_bold
+        ws["A7"].alignment = Alignment(horizontal="left", wrap_text=True)
 
-    ws["B8"].value     = "INVOICE #"
-    ws["B8"].font      = arial11_bold
-    ws["B8"].alignment = Alignment(horizontal="right", vertical="center")
+        ws["B7"].value     = "DATE:"
+        ws["B7"].font      = arial11_bold
+        ws["B7"].alignment = Alignment(horizontal="right")
 
-    invoice_number = str(config.get("invoice_number", "espana"))[:10]
-    ws["C8"].value     = invoice_number
-    ws["C8"].font      = arial11
-    ws["C8"].alignment = Alignment(horizontal="left", vertical="center")
+        today = datetime.now()
+        ws["C7"].value        = datetime(today.year, today.month, today.day)
+        ws["C7"].number_format = "mm-dd-yy"
 
-    ws["A9"].value     = "SENDER_ADDRESS2"
-    ws["A9"].font      = arial11
-    ws["A9"].alignment = Alignment(vertical="center", wrap_text=True)
+        ws["A8"].value     = sender.get("address1", "")
+        ws["A8"].font      = arial11
+        ws["A8"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    ws["B9"].value     = "FOR:"
-    ws["B9"].font      = arial11_bold
-    ws["B9"].alignment = Alignment(horizontal="right", vertical="top", wrap_text=True)
+        ws["B8"].value     = "INVOICE #"
+        ws["B8"].font      = arial11_bold
+        ws["B8"].alignment = Alignment(horizontal="right", vertical="center")
 
-    ws["C9"].value     = "Software Development"
-    ws["C9"].font      = arial11
-    ws["C9"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        invoice_number = str(config.get("invoice_number", ""))[:10]
+        ws["C8"].value     = invoice_number
+        ws["C8"].font      = arial11
+        ws["C8"].alignment = Alignment(horizontal="left", vertical="center")
 
-    ws["A10"].value        = "SENDER_PHONE"
-    ws["A10"].font         = arial11
-    ws["A10"].alignment    = Alignment(vertical="center")
-    ws["A10"].number_format = "@"
+        ws["A9"].value     = sender.get("address2", "")
+        ws["A9"].font      = arial11
+        ws["A9"].alignment = Alignment(vertical="center", wrap_text=True)
 
-    ws["A11"].value     = "Bill to:"
-    ws["A11"].font      = arial11_bold
-    ws["A11"].alignment = Alignment(horizontal="left")
+        ws["B9"].value     = "FOR:"
+        ws["B9"].font      = arial11_bold
+        ws["B9"].alignment = Alignment(horizontal="right", vertical="top", wrap_text=True)
 
-    ws["A12"].value     = "BILLTO_NAME"
-    ws["A12"].font      = arial11
-    ws["A12"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["C9"].value     = config.get("service", "Software Development")
+        ws["C9"].font      = arial11
+        ws["C9"].alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
 
-    ws["A13"].value     = "BILLTO_ADDRESS1"
-    ws["A13"].font      = arial11
-    ws["A13"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A10"].value        = sender.get("phone", "")
+        ws["A10"].font         = arial11
+        ws["A10"].alignment    = Alignment(vertical="center")
+        ws["A10"].number_format = "@"
 
-    ws["A14"].value     = "BILLTO_ADDRESS2"
-    ws["A14"].font      = arial11
-    ws["A14"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws["A11"].value     = "Bill to:"
+        ws["A11"].font      = arial11_bold
+        ws["A11"].alignment = Alignment(horizontal="left")
 
-    ws["A15"].value        = "BILLTO_PHONE"
-    ws["A15"].font         = arial11
-    ws["A15"].alignment    = Alignment(horizontal="left", vertical="top")
-    ws["A15"].number_format = "@"
+        ws["A12"].value     = bill_to.get("name", "")
+        ws["A12"].font      = arial11
+        ws["A12"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    # ── Table header (row 16) ──────────────────────────────────────────────────
+        ws["A13"].value     = bill_to.get("address1", "")
+        ws["A13"].font      = arial11
+        ws["A13"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A14"].value     = bill_to.get("address2", "")
+        ws["A14"].font      = arial11
+        ws["A14"].alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        ws["A15"].value        = bill_to.get("phone", "")
+        ws["A15"].font         = arial11
+        ws["A15"].alignment    = Alignment(horizontal="left", vertical="top")
+        ws["A15"].number_format = "@"
+
+    # ── Table header ───────────────────────────────────────────────────────────
+    table_header_row = 1 if table_only else 16
     for col, label in [("A", "Date"), ("B", "DESCRIPTION"), ("C", "HOURS")]:
-        cell = ws[f"{col}16"]
+        cell = ws[f"{col}{table_header_row}"]
         cell.value     = label
         cell.alignment = cv
         cell.border    = all_borders
         cell.fill      = white_fill
 
-    # ── Time entries (rows 17+) ────────────────────────────────────────────────
-    row = 17
+    # ── Time entries ───────────────────────────────────────────────────────────
+    row = table_header_row + 1
     for i, entry in enumerate(sorted_entries):
         entry_date = datetime.strptime(entry["date"], "%Y-%m-%d").date()
         fill = white_fill if i % 2 == 1 else no_fill
@@ -298,28 +303,35 @@ def generate_invoice(plan: list[dict], config: dict, output_path: Path) -> None:
     ws.row_dimensions[total_row].height = 15.75
 
     # ── Footer ─────────────────────────────────────────────────────────────────
-    footer_lines = [
-        "Make all checks payable to SENDER_NAME",
-        "If you have any questions concerning this invoice, use the following contact information:",
-        "SENDER_NAME, SENDER_PHONE, SENDER_EMAIL",
-        "THANK YOU FOR YOUR BUSINESS! ",
-    ]
-    footer_start = total_row + 1
-    for i, line in enumerate(footer_lines):
-        r = footer_start + i
-        ws.merge_cells(f"A{r}:C{r}")
-        ws[f"A{r}"].value     = line
-        ws[f"A{r}"].alignment = Alignment(horizontal="center", wrap_text=True)
-        ws[f"A{r}"].font      = arial11
-        ws.row_dimensions[r].height = 15.75
+    last_row = total_row
+    if not table_only:
+        sender = config.get("sender", {})
+        sender_name  = sender.get("name", "")
+        sender_phone = sender.get("phone", "")
+        sender_email = sender.get("email", "")
+        contact_line = ", ".join(x for x in [sender_name, sender_phone, sender_email] if x)
+        footer_lines = [
+            f"Make all checks payable to {sender_name}".strip(),
+            "If you have any questions concerning this invoice, use the following contact information:",
+            contact_line,
+            "THANK YOU FOR YOUR BUSINESS! ",
+        ]
+        footer_start = total_row + 1
+        for i, line in enumerate(footer_lines):
+            r = footer_start + i
+            ws.merge_cells(f"A{r}:C{r}")
+            ws[f"A{r}"].value     = line
+            ws[f"A{r}"].alignment = Alignment(horizontal="center", wrap_text=True)
+            ws[f"A{r}"].font      = arial11
+            ws.row_dimensions[r].height = 15.75
 
-    # Last footer line bold
-    thank_you_row = footer_start + len(footer_lines) - 1
-    ws[f"A{thank_you_row}"].font      = arial11_bold
-    ws[f"A{thank_you_row}"].alignment = Alignment(horizontal="center", vertical="bottom")
+        # Last footer line bold
+        thank_you_row = footer_start + len(footer_lines) - 1
+        ws[f"A{thank_you_row}"].font      = arial11_bold
+        ws[f"A{thank_you_row}"].alignment = Alignment(horizontal="center", vertical="bottom")
+        last_row = thank_you_row
 
     # ── Page setup ─────────────────────────────────────────────────────────────
-    last_row = thank_you_row
     ws.print_area = f"A1:C{last_row}"
     ws.page_setup.fitToPage   = True
     ws.page_setup.fitToWidth  = 1
@@ -353,6 +365,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to plan.json (default: same directory as config)")
     p.add_argument("--output", default=None, metavar="PATH",
                    help="Output .xlsx path (default: same directory as config)")
+    p.add_argument("--table-only", action="store_true",
+                   help="Output only the time table — no header or footer (removes sensitive info)")
     return p.parse_args()
 
 
@@ -402,7 +416,7 @@ def main() -> None:
             output_path = config_path.parent / f"{base}_{counter}.xlsx"
             counter += 1
 
-    generate_invoice(plan, config, output_path)
+    generate_invoice(plan, config, output_path, table_only=args.table_only)
 
 
 if __name__ == "__main__":
