@@ -1,0 +1,10 @@
+{
+    "clockify_api_key": "YOUR_API_KEY_HERE",      // Profile → API → Generate (api.clockify.me)
+    "workspace_id":     "YOUR_WORKSPACE_ID_HERE", // URL: clockify.me/workspaces/{workspaceId}/...
+    "month":            "2026-03",                // Target month in YYYY-MM format
+    "work_start":       "12:00",                  // Start of fillable window (local time)
+    "work_end":         "20:00",                  // End   of fillable window (local time)
+    "timezone":         "Europe/Madrid",          // IANA timezone name
+    "skip_weekends":    true,                     // Exclude Sat/Sun from working days
+    "hourly_rate":      43.75                     // Used by generate_invoice.py to calculate totals
+}

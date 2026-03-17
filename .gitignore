@@ -1,6 +1,38 @@
+# ── Sensitive / credentials ───────────────────────────────────────────────────
+config.json          # Contains API key and workspace ID — copy config.example.json
+tickets.txt          # May contain internal project/ticket identifiers
+clockify_report.csv  # Contains time-tracking data
+*.xlsx               # Invoice files with financial data
+plan.json            # Generated plan (may reference internal tickets)
+plan.csv
+meta.json
+skip_days.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
+*.spec
+build/
+dist/
+
+# ── Node / frontend ───────────────────────────────────────────────────────────
+node_modules/
+clockify-fill-app/node_modules/
+package-lock.json
+clockify-fill-app/package-lock.json
+
+# ── Rust / Tauri ──────────────────────────────────────────────────────────────
+clockify-fill-app/src-tauri/target/
+clockify-fill-app/src-tauri/binaries/
+clockify-fill-app/src-tauri/gen/
+clockify-fill-app/src-tauri/Cargo.lock
+
+# ── App assets (generated) ────────────────────────────────────────────────────
+clockify-fill-app/src-tauri/icons/
+clockify-fill-app/app-icon.png
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
 .env
-clockify_report.csv
 .claude/
+docs/
